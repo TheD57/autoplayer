@@ -1,0 +1,14 @@
+  {
+    "manifest_version": 3,
+    "name": "EOS Autoplay",
+    "version": "1.0",
+    "description": "Active l'autoplay automatique pour les séries sur EOS",
+    "permissions": ["activeTab"],
+    "host_permissions": [
+      "https://www.eos.to/*"
+    ],
+    "content_scripts": [{
+      "matches": ["https://www.eos.to/*"],
+      "js": ["autoplay.js"]
+    }]
+  }
