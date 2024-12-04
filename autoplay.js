@@ -1,78 +1,79 @@
-// Configuration
-const config = {
-    nextEpisodeButtonSelector: '.btn[title="épisode suivant"]',
-    videoContainerSelector: '.rmp-container',
-    videoPlayerSelector: '.rmp-video',
-    fullscreenButtonSelector: '.rmp-fullscreen',
-    playButtonSelector: '.rmp-play-pause',
-    checkInterval: 1000,
-    timeBeforeEndThreshold: 90,
-    debugMode: false
-};
+// Configuration avec Object.freeze pour prevenir des modifications accidentelles (like real const)
+const config = Object.freeze({
+    selectors: Object.freeze({
+        nextEpisodeButton: '.btn[title="épisode suivant"]',
+        videoContainer: '.rmp-container',
+        videoPlayer: '.rmp-video',
+        fullscreen: '.rmp-fullscreen',
+        playPause: '.rmp-play-pause'
+    }),
+    timing: Object.freeze({
+        checkInterval: 1000,
+        timeBeforeEndThreshold: 90
+    }),
+    storage: Object.freeze({
+        key: 'autoPlayState'
+    }),
+    debugMode: true
+});
 
 class AutoPlayManager {
+    #videoElement;
+    #nextButton;
+    #checkIntervalId;
+    #wasFullscreen;
+    #debug;
+    #fullscreenRequested;
+    #videoContainer;
+    #fullscreenPromptShown;
+    #isTransitioningToFullscreen;
+    #toast;
+    #fullscreenButton;
+    #playButton;
+
     constructor() {
-        this.videoElement = null;
-        this.nextButton = null;
-        this.checkIntervalId = null;
-        this.wasFullscreen = this.loadState().wasFullscreen || false;
-        this.debug = config.debugMode;
-        this.fullscreenRequested = false;
-        this.videoContainer = null;
-        this.fullscreenPromptShown = false;
-        this.isTransitioningToFullscreen = false;
-        this.toast = null;
-        this.log('Constructor initialized', {
-            wasFullscreen: this.wasFullscreen,
-            debugMode: this.debug
+        this.#debug = config.debugMode;
+        this.#wasFullscreen = this.#loadState().wasFullscreen || false;
+        this.#fullscreenRequested = false;
+        this.#fullscreenPromptShown = false;
+        this.#isTransitioningToFullscreen = false;
+
+        this.#log('Constructor initialized', {
+            wasFullscreen: this.#wasFullscreen,
+            debugMode: this.#debug
         });
     }
 
-    saveState(state) {
-        this.log('Saving state', state);
-        localStorage.setItem('autoPlayState', JSON.stringify(state));
+    #saveState(state) {
+        this.#log('Saving state', state);
+        try {
+            localStorage.setItem(config.storage.key, JSON.stringify(state));
+        } catch (error) {
+            this.#log('Error saving state', { error: error.message });
+        }
     }
 
-    loadState() {
+    #loadState() {
         try {
-            return JSON.parse(localStorage.getItem('autoPlayState')) || {};
-        } catch {
-            this.log('Error loading state', { error: error.message });
+            return JSON.parse(localStorage.getItem(config.storage.key)) || {};
+        } catch (error) {
+            this.#log('Error loading state', { error: error.message });
             return {};
         }
     }
 
-    log(message) {
-        if (this.debug){
-            const timestamp = new Date().toISOString();
-            console.log(`[AutoPlay ${timestamp}] ${message}`);
-        }
+    #log(message, data = {}) {
+        if (!this.#debug) return;
+
+        const timestamp = new Date().toISOString();
+        console.log(`[AutoPlay ${timestamp}]`, message, data);
     }
 
-    init() {
-        this.log('Initializing AutoPlayManager');
-        this.findElements();
-        if (this.videoElement) {
-            this.setupEventListeners();
-            this.log('Manager initialized with elements', {
-                videoFound: !!this.videoElement,
-                nextButtonFound: !!this.nextButton,
-                fullscreenButtonFound: !!this.fullscreenButton,
-                playButtonFound: !!this.playButton,
-                containerFound: !!this.videoContainer
-            });
-            this.autoPlayIfNeeded();
-            this.createToastElement();
-        }
-        else {
-            this.log('Initialization failed - video element not found');
-        }
-    }
+    // Utilisation de WeakMap pour stocker les event listeners
+    #eventListeners = new WeakMap();
 
-    createToastElement() {
-        this.log('Creating toast element');
-        const toast = document.createElement('div');
-        toast.innerHTML = `
+    #createToastElement() {
+        const toastTemplate = `
             <div class="next-episode-toast" style="display: none; position: absolute; bottom: 80px; right: 20px; 
                 background: rgba(0, 0, 0, 0.9); color: white; padding: 20px; border-radius: 8px; z-index: 9999;
                 font-family: Arial, sans-serif;">
@@ -88,19 +89,166 @@ class AutoPlayManager {
                     </button>
                 </div>
             </div>`;
-        
-        this.toast = toast.firstElementChild;
-        this.videoContainer.appendChild(this.toast);
 
-        this.log('Toast element created and added to container');
+        const template = document.createElement('template');
+        template.innerHTML = toastTemplate.trim();
+        this.#toast = template.content.firstElementChild;
 
-        // Event listeners for buttons
-        this.toast.querySelector('.skip-credits').addEventListener('click', () => {            this.log('Skip credits button clicked');this.goToNextEpisode()});
-        this.toast.querySelector('.next-episode').addEventListener('click', () => {this.log('Next episode button clicked'); this.goToNextEpisode()});
+        this.#toast.addEventListener('click', (e) => {
+            if (e.target.closest('.skip-credits, .next-episode')) {
+                this.#log(`${e.target.className} button clicked`);
+                this.#goToNextEpisode();
+            }
+        });
+
+        this.#videoContainer.appendChild(this.#toast);
+        this.#log('Toast element created and added to container');
     }
 
-    createFullscreenPrompt() {
-        this.log('Creating fullscreen prompt');
+    #findElements() {
+        const selectors = config.selectors;
+        this.#videoElement = document.querySelector(selectors.videoPlayer);
+        this.#nextButton = document.querySelector(selectors.nextEpisodeButton);
+        this.#fullscreenButton = document.querySelector(selectors.fullscreen);
+        this.#playButton = document.querySelector(selectors.playPause);
+        this.#videoContainer = document.querySelector(selectors.videoContainer);
+
+        return Boolean(this.#videoElement && this.#videoContainer);
+    }
+
+    #setupEventListeners() {
+        // Utilisation de requestAnimationFrame pour des vérifications plus fluides
+        let lastCheck = 0;
+        const checkProgress = (timestamp) => {
+            if (timestamp - lastCheck >= config.timing.checkInterval) {
+                this.#checkVideoProgress();
+                lastCheck = timestamp;
+            }
+            this.#checkIntervalId = requestAnimationFrame(checkProgress);
+        };
+        this.#checkIntervalId = requestAnimationFrame(checkProgress);
+
+        // Meilleure gestion des événements
+        const controller = new AbortController();
+        const signal = controller.signal;
+
+        document.addEventListener('fullscreenchange', () => {
+            const isFullscreen = Boolean(document.fullscreenElement);
+            this.#handleFullscreenChange(isFullscreen);
+        }, { signal });
+
+        if (this.#videoElement) {
+            // Gestion de la fin de la vidéo
+            this.#videoElement.addEventListener('ended', () => {
+                this.#log('Video ended event triggered');
+                if (!this.#nextButton) {
+                    this.#log('No next episode available, stopping manager');
+                    this.stop();
+                    return;
+                }
+                this.#goToNextEpisode();
+            }, { signal });
+
+            // Gestion des erreurs de lecture
+            this.#videoElement.addEventListener('error', (e) => {
+                this.#log('Video error triggered', { error: e });
+                this.#log('Video error occurred', {
+                    error: this.#videoElement.error,
+                    errorCode: this.#videoElement.error?.code,
+                    errorMessage: this.#videoElement.error?.message
+                });
+                this.#log('Stopping manager');
+                this.stop();
+            }, { signal });
+
+            // Gestion des échecs de chargement
+            this.#videoElement.addEventListener('stalled', () => {
+                this.#log('Video playback stalled');
+                // On attend un peu avant de stopper pour laisser une chance de récupération
+                setTimeout(() => {
+                    if (this.#videoElement?.error) {
+                        this.#log('Video recovery failed, stopping manager');
+                        this.stop();
+                    }
+                }, 5000);
+            }, { signal });
+        }
+
+        // Stockage du controller pour le nettoyage
+        this.#eventListeners.set(this, controller);
+    }
+
+    #handleFullscreenChange(isFullscreen) {
+        this.#log('Fullscreen state changed', {
+            isFullscreen,
+            wasFullscreen: this.#wasFullscreen,
+            isTransitioning: this.#isTransitioningToFullscreen
+        });
+
+        this.#wasFullscreen = isFullscreen;
+        this.#saveState({ wasFullscreen: isFullscreen });
+
+        if (isFullscreen && this.#videoElement?.paused && this.#isTransitioningToFullscreen) {
+            this.#log('Auto-playing video after fullscreen transition');
+            this.#videoElement.play().catch(error => this.#log('Error auto-playing video', { error }));
+            this.#isTransitioningToFullscreen = false;
+        }
+
+        this.#fullscreenRequested = false;
+    }
+
+    #checkVideoProgress() {
+        if (!this.#videoElement?.duration || !this.#nextButton) return;
+
+        const timeRemaining = this.#videoElement.duration - this.#videoElement.currentTime;
+
+        if (timeRemaining <= config.timing.timeBeforeEndThreshold) {
+            this.#showToast();
+            this.#updateCountdown(Math.floor(timeRemaining));
+        } else {
+            this.#hideToast();
+        }
+
+        if (timeRemaining <= 0 && !this.#videoElement.paused) {
+            this.#goToNextEpisode();
+        }
+    }
+
+    init() {
+        this.#log('Initializing AutoPlayManager');
+
+        if (!this.#findElements()) {
+            this.#log('Initialization failed - required elements not found');
+            return false;
+        }
+
+        this.#createToastElement();
+        this.#setupEventListeners();
+
+        const state = this.#loadState();
+        if (state.shouldAutoPlay) {
+            this.#autoPlayIfNeeded();
+        }
+
+        return true;
+    }
+
+    #autoPlayIfNeeded() {
+        this.#log('Auto-resuming after page change');
+
+        if (this.#playButton) {
+            this.#playButton.click();
+
+            if (this.#wasFullscreen && !this.#fullscreenPromptShown) {
+               this.#showFullscreenPrompt();
+            }
+        }
+
+        this.#saveState({ shouldAutoPlay: false });
+    }
+
+    #showFullscreenPrompt() {
+        this.#log('Creating fullscreen prompt');
         const prompt = document.createElement('div');
         prompt.id = 'fullscreen-prompt';
         prompt.innerHTML = `
@@ -216,179 +364,110 @@ class AutoPlayManager {
         const declineButton = prompt.querySelector('.decline-button');
 
         acceptButton.addEventListener('click', () => {
-            this.log('Fullscreen prompt accepted');
-            this.isTransitioningToFullscreen = true;
-            this.fullscreenButton.click();
+            this.#log('Fullscreen prompt accepted');
+            this.#isTransitioningToFullscreen = true;
+            this.#fullscreenButton.click();
             prompt.style.display = 'none';
         });
 
         declineButton.addEventListener('click', () => {
-            this.log('Fullscreen prompt declined');
+            this.#log('Fullscreen prompt declined');
             prompt.style.display = 'none';
-            this.saveState({ wasFullscreen: false });
+            this.#saveState({ wasFullscreen: false });
         });
+        this.#log('Showing fullscreen prompt');
+        this.#fullscreenPromptShown = true;
+        this.#videoContainer.appendChild(prompt);
 
-        return prompt;
     }
-
-    findElements() {
-        this.videoElement = document.querySelector(config.videoPlayerSelector);
-        this.nextButton = document.querySelector(config.nextEpisodeButtonSelector);
-        this.fullscreenButton = document.querySelector(config.fullscreenButtonSelector);
-        this.playButton = document.querySelector(config.playButtonSelector);
-        this.videoContainer = document.querySelector(config.videoContainerSelector);
-        this.log('Elements found', {
-            videoElement: !!this.videoElement,
-            nextButton: !!this.nextButton,
-            fullscreenButton: !!this.fullscreenButton,
-            playButton: !!this.playButton,
-            videoContainer: !!this.videoContainer
-        });
-    }
-
-    autoPlayIfNeeded() {
-        const state = this.loadState();
-        this.log('Checking if autoplay needed', { state });
-        
-        if (state.shouldAutoPlay) {
-            this.log('Auto-resuming after page change');
-            if (this.playButton) {
-                this.playButton.click();
-                if (state.wasFullscreen && !this.fullscreenPromptShown) {
-                    this.log('Showing fullscreen prompt');
-                    this.fullscreenPromptShown = true;
-                    const prompt = this.createFullscreenPrompt();
-                    this.videoContainer.appendChild(prompt);
-                }
-            }
-            else {
-                this.log('Play button not found for auto-play');
-            }
-            this.saveState({ shouldAutoPlay: false });
-        }
-    }
-    setupEventListeners() {
-        this.log('Setting up event listeners');
-        this.checkIntervalId = setInterval(() => this.checkVideoProgress(), config.checkInterval);
-        
-        document.addEventListener('fullscreenchange', () => {
-            const isFullscreen = !!document.fullscreenElement;
-            this.log('Fullscreen state changed', { 
-                isFullscreen,
-                wasFullscreen: this.wasFullscreen,
-                isTransitioning: this.isTransitioningToFullscreen 
-            });
-            
-            this.wasFullscreen = isFullscreen;
-            this.saveState({ wasFullscreen: isFullscreen });
-            
-            if (isFullscreen && this.videoElement.paused && this.isTransitioningToFullscreen) {
-                this.log('Auto-playing video after fullscreen transition');
-                this.videoElement.play();
-                this.isTransitioningToFullscreen = false;
-            }
-            
-            this.fullscreenRequested = false;
-        });
-
-        if (this.videoElement) {
-            this.videoElement.addEventListener('ended', () => {
-                this.log('Video ended event triggered');
-                this.goToNextEpisode();
-            });
-        }
-    }
-
-    checkVideoProgress() {
-        if (!this.videoElement || !this.nextButton) {
-            this.log('Missing required elements for progress check', {
-                videoElement: !!this.videoElement,
-                nextButton: !!this.nextButton
-            });
-            return;
-        }
-        
-        const timeRemaining = this.videoElement.duration - this.videoElement.currentTime;
-        const currentTime = this.videoElement.currentTime;
-        const duration = this.videoElement.duration;
-
-        this.log('Video progress check', {
-            currentTime: currentTime.toFixed(2),
-            duration: duration.toFixed(2),
-            timeRemaining: timeRemaining.toFixed(2),
-            isPaused: this.videoElement.paused
-        });
-
-        if (timeRemaining <= config.timeBeforeEndThreshold) {
-            this.log('Approaching video end, showing toast');
-            this.showToast();
-            this.updateCountdown(Math.floor(timeRemaining));
-        } else {
-            this.hideToast();
-        }
-        
-        if (timeRemaining <= 0 && !this.videoElement.paused) {
-            this.log('Video ended naturally, going to next episode');
-            this.goToNextEpisode();
-        }
-    }
-
-    updateCountdown(seconds) {
-        const countdownEl = this.toast.querySelector('.countdown');
+    #updateCountdown(seconds) {
+        const countdownEl = this.#toast?.querySelector('.countdown');
         if (countdownEl) {
-            this.log('Updating countdown', { seconds });
+            this.#log('Updating countdown', { seconds });
             countdownEl.textContent = Math.max(0, seconds);
         }
     }
-    
-    showToast() {
-        if (this.toast) {
-            this.log('Showing toast');
-            this.toast.style.display = 'block';
+
+    #showToast() {
+        if (this.#toast) {
+            this.#log('Showing toast');
+            this.#toast.style.display = 'block';
         }
     }
 
-    hideToast() {
-        if (this.toast) {
-            this.log('Hiding toast');
-            this.toast.style.display = 'none';
+    #hideToast() {
+        if (this.#toast) {
+            this.#log('Hiding toast');
+            this.#toast.style.display = 'none';
         }
     }
 
-    goToNextEpisode() {
-        this.log('Attempting to go to next episode', {
-            nextButtonExists: !!this.nextButton,
-            wasFullscreen: this.wasFullscreen
+    #goToNextEpisode() {
+        this.#log('Attempting to go to next episode', {
+            nextButtonExists: Boolean(this.#nextButton),
+            wasFullscreen: this.#wasFullscreen
         });
-        
-        if (!this.nextButton) {
-            this.log('Next button not found, cannot proceed');
+
+        if (!this.#nextButton) {
+            this.#log('Next button not found, cannot proceed');
             return;
         }
-        
-        this.saveState({
+
+        this.#saveState({
             shouldAutoPlay: true,
-            wasFullscreen: this.wasFullscreen
+            wasFullscreen: this.#wasFullscreen
         });
-        
-        this.log('Clicking next episode button');
-        this.nextButton.click();
-    }
 
+        this.#log('Clicking next episode button');
+        this.#nextButton.click();
+    }
     stop() {
-        this.log('Stopping AutoPlayManager');
-        if (this.checkIntervalId) {
-            clearInterval(this.checkIntervalId);
-            this.checkIntervalId = null;
-        }
-        if (this.toast) {
-            this.toast.remove();
-            this.toast = null;
-        }
-        this.log('AutoPlayManager stopped successfully');
-    }
-}
+        this.#log('Stopping AutoPlayManager');
 
+        // Arrêt des vérifications de progression
+        if (this.#checkIntervalId) {
+            cancelAnimationFrame(this.#checkIntervalId);
+            this.#checkIntervalId = null;
+        }
+
+        // Nettoyage des event listeners
+        const controller = this.#eventListeners.get(this);
+        if (controller) {
+            controller.abort();
+            this.#eventListeners.delete(this);
+        }
+
+        // Suppression du toast s'il existe
+        if (this.#toast) {
+            this.#toast.remove();
+            this.#toast = null;
+        }
+
+        this.#videoElement = null;
+        this.#nextButton = null;
+        this.#fullscreenButton = null;
+        this.#playButton = null;
+        this.#videoContainer = null;
+
+        this.#wasFullscreen = false;
+        this.#fullscreenRequested = false;
+        this.#fullscreenPromptShown = false;
+        this.#isTransitioningToFullscreen = false;
+
+        this.#saveState({
+            shouldAutoPlay: false,
+            wasFullscreen: false
+        });
+
+        this.#log('AutoPlayManager stopped successfully');
+        return true;
+    }
+
+}
 // Initialize the manager
-const autoPlayManager = new AutoPlayManager();
-autoPlayManager.init();
+let autoPlayManager = new AutoPlayManager();
+// Réinitialisation en cas d'erreur de lecture
+if (autoPlayManager.init() === false) {
+    autoPlayManager.stop();
+    autoPlayManager = null;
+}
